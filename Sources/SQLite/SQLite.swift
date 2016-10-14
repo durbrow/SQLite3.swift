@@ -5,8 +5,14 @@ public enum SQLiteError : Error {
     case Error(code: Int, message: String)
 }
 
+private func convert_sqlite_info_array(count: Int, array: UnsafeMutablePointer<UnsafeMutablePointer<Int8>?>?) -> [String?]
+{
+    guard let array = array else { return [] }
+    return UnsafeBufferPointer(start: UnsafePointer(array), count: count).map { $0 == nil ? nil : String(cString: $0!) }
+}
+
 public final class Database {
-    fileprivate let obj : OpaquePointer
+    fileprivate let dbh : OpaquePointer
     
     /// Opens a database
     public init(path: String) throws {
@@ -14,7 +20,7 @@ public final class Database {
         let rc = sqlite3_open(path, &pDb)
         guard let obj = pDb else { throw SQLiteError.Error(code: Int(rc), message: "Out of memory") }
         if rc == SQLITE_OK {
-            self.obj = obj
+            self.dbh = obj
             return
         }
         defer { sqlite3_close(obj) }
@@ -27,48 +33,200 @@ public final class Database {
         try self.init(path: ":memory:")
     }
     deinit {
-        sqlite3_close_v2(obj)
+        sqlite3_close_v2(dbh)
     }
     
     fileprivate var errorMessage : String {
-        return String(cString: sqlite3_errmsg(obj))
+        return String(cString: sqlite3_errmsg(dbh))
     }
-    
+
     public func prepare(sql: String) throws -> Statement {
         var pStm : OpaquePointer?
-        let rc = sqlite3_prepare_v2(obj, sql, -1, &pStm, nil)
+        let rc = sqlite3_prepare_v2(dbh, sql, -1, &pStm, nil)
         if rc == SQLITE_OK {
             return Statement(pStm!)
         }
         throw SQLiteError.Error(code: Int(rc), message: errorMessage)
     }
+}
+
+public extension Database {
+    public func execute(sql: String) throws
+    {
+        var errmsg : UnsafeMutablePointer<Int8>?
+        let rc = sqlite3_exec(dbh, sql, nil, nil, &errmsg)
+        if rc == SQLITE_OK { return }
+        defer { sqlite3_free(errmsg) }
+        throw SQLiteError.Error(code: Int(rc), message: errmsg == nil ? "" : String(cString: errmsg!))
+    }
     
-    public func execute(sql: String) throws {
+    public func execute(sql: String, f: @escaping ([String?], [String?])->(Int)) throws {
+        struct CContext {
+            let function : ([String?], [String?])->(Int)
+        }
+        var context = CContext(function: f)
+        var errmsg : UnsafeMutablePointer<Int8>?
+        let rc = sqlite3_exec(dbh, sql,
+          { (UP, N, coldata, colname) -> Int32 in
+            let data = convert_sqlite_info_array(count: Int(N), array: coldata)
+            let name = convert_sqlite_info_array(count: Int(N), array: colname)
+            let rslt = UP!.bindMemory(to: CContext.self, capacity: 1).pointee.function(data, name)
+            return CInt(truncatingBitPattern: rslt)
+          }, &context, &errmsg)
+        if rc == SQLITE_OK { return }
+        defer { sqlite3_free(errmsg) }
+        throw SQLiteError.Error(code: Int(rc), message: errmsg == nil ? "" : String(cString: errmsg!))
+    }
+    
+    public func execute(sql: String, parameters: () -> [String?]?) throws
+    {
         let stm = try prepare(sql: sql)
-        while try stm.step() {}
+        while let params = parameters() {
+            try stm.bind(values: params)
+            _ = try stm.step()
+            try stm.reset()
+        }
+    }
+    
+    public func execute(sql: String, committingEvery soOften: Int, parameters: () -> [String?]?) throws
+    {
+        guard soOften > 1 else { return try execute(sql: sql, parameters: parameters) }
+        try! execute(sql: "BEGIN TRANSACTION")
+        defer { try! execute(sql: "COMMIT TRANSACTION") }
+        do {
+            var countdown = soOften
+            let stm = try prepare(sql: sql)
+            while let params = parameters() {
+                try stm.bind(values: params)
+                _ = try stm.step()
+                try! stm.reset()
+                countdown -= 1
+                if countdown == 0 {
+                    try! execute(sql: "COMMIT TRANSACTION")
+                    try! execute(sql: "BEGIN TRANSACTION")
+                    countdown = soOften
+                }
+            }
+        }
+    }
+    
+    public func execute(sql: String, parameters: [[String?]]) throws
+    {
+        var iter = parameters.makeIterator()
+        try execute(sql: sql) { iter.next() }
     }
 }
+
+public extension Database {
+    public func dump(sql: String) throws
+    {
+        try execute(sql: sql)
+        { data, name in
+            for (i, v) in data.enumerated() {
+                print("\(name[i] ?? "\(i)"): \(v ?? "NULL")")
+            }
+            print("")
+            return 0
+        }
+    }
+}
+
+/// create a copy of a Swift.String into memory that can be freed by sqlite3_free
+private func sqlite_strdup(value: String) -> UnsafeBufferPointer<Int8>
+{
+    let length = value.utf8.count
+#if arch(arm64) || arch(x86_64)
+    guard let p = sqlite3_malloc64(sqlite3_uint64(length + 1)) else {
+        return UnsafeBufferPointer(start: nil, count: 0)
+    }
+#else
+    guard let p = sqlite3_malloc(Int32(length + 1)) else {
+        return UnsafeBufferPointer(start: nil, count: 0)
+    }
+#endif
+    value.withCString { p.copyBytes(from: $0, count: length + 1) }
+    let q = UnsafePointer(p.bindMemory(to: Int8.self, capacity: length + 1))
+    return UnsafeBufferPointer(start: q, count: length)
+}
+
+private let sqlite_free : @convention(c) (UnsafeMutableRawPointer?) -> () = { sqlite3_free($0) }
+private let sqlite_nofree : @convention(c) (UnsafeMutableRawPointer?) -> () = { _ in return }
 
 public final class Statement {
     private let stm : OpaquePointer
     
-    fileprivate init(_ stm: OpaquePointer) {
+    fileprivate init(_ stm: OpaquePointer)
+    {
         self.stm = stm
     }
-    deinit {
+    deinit
+    {
         sqlite3_finalize(stm)
     }
     
-    fileprivate var dbHandle : OpaquePointer {
+    fileprivate var dbHandle : OpaquePointer
+    {
         return sqlite3_db_handle(stm)
     }
 
-    fileprivate var errorMessage : String {
+    fileprivate var errorMessage : String
+    {
         return String(cString: sqlite3_errmsg(dbHandle))
     }
-    
-    public func bind() {
         
+    public func bind(number i: Int, value: String?) throws
+    {
+        if let value = value {
+            let value = sqlite_strdup(value: value)
+            let rc = sqlite3_bind_text64(stm, Int32(i), value.baseAddress, sqlite3_uint64(value.count), sqlite_free, UInt8(SQLITE_UTF8))
+            guard rc == SQLITE_OK else { throw SQLiteError.Error(code: Int(rc), message: errorMessage) }
+        }
+        else {
+            let rc = sqlite3_bind_null(stm, Int32(i))
+            guard rc == SQLITE_OK else { throw SQLiteError.Error(code: Int(rc), message: errorMessage) }
+        }
+    }
+    
+    public func bind(name: String, value: String?) throws
+    {
+        let i = Int(sqlite3_bind_parameter_index(stm, name))
+        if i > 0 {
+            try bind(number: i, value: value)
+        }
+    }
+    
+    public func bind(number i: Int, value: UnsafeBufferPointer<Void>) throws
+    {
+#if arch(arm64) || arch(x86_64)
+        let rc = sqlite3_bind_blob64(stm, Int32(i), value.baseAddress, sqlite3_uint64(value.count), sqlite_nofree)
+#else
+        let rc = sqlite3_bind_blob(stm, Int32(i), value.baseAddress, Int32(value.count), sqlite_nofree)
+#endif
+        guard rc == SQLITE_OK else { throw SQLiteError.Error(code: Int(rc), message: errorMessage) }
+    }
+    
+    public func bind(name: String, value: UnsafeBufferPointer<Void>) throws
+    {
+        let i = Int(sqlite3_bind_parameter_index(stm, name))
+        if i > 0 {
+            try bind(number: i, value: value)
+        }
+    }
+    
+    public func bind(values: [String?]) throws
+    {
+        try clearBindings()
+        for (i, v) in values.enumerated() {
+            try bind(number: i + 1, value: v)
+        }
+    }
+    
+    public func bind(values: [String:String?]) throws
+    {
+        try clearBindings()
+        for (k, v) in values {
+            try bind(name: k, value: v)
+        }
     }
     
     public func clearBindings() throws {
@@ -94,34 +252,16 @@ public final class Statement {
         return Int(sqlite3_column_count(stm))
     }
     
-#if arch(arm64) || arch(x86_64)
-    public func columnAsInt(_ i: Int) -> Int {
-        return Int(sqlite3_column_int64(stm, Int32(i)))
-    }
-#else
-    public func columnAsInt64(_ i: Int) -> Int64 {
-        return Int64(sqlite3_column_int64(stm, Int32(i)))
-    }
-
-    public func columnAsInt(_ i: Int) -> Int {
-        return Int(sqlite3_column_int(stm, Int32(i)))
-    }
-#endif
-    
-    public func columnAsDouble(_ i: Int) -> Double {
-        return sqlite3_column_double(stm, Int32(i))
-    }
-    
-    public func columnAsString(_ i: Int) -> String? {
+    public subscript(i: Int) -> String? {
         guard let data = sqlite3_column_text(stm, Int32(i)) else { return nil }
         return String(cString: data)
     }
     
-    public func columnAsBlob(_ i: Int) -> (UnsafeRawPointer?, Int) {
+    public func blob(_ i: Int) -> UnsafeBufferPointer<Void> {
         guard let data = sqlite3_column_blob(stm, Int32(i))
-            else { return (nil, 0) }
+            else { return UnsafeBufferPointer(start: nil, count: 0) }
         let bytes = sqlite3_column_bytes(stm, Int32(i))
-        return (data, Int(bytes))
+        return UnsafeBufferPointer(start: data.bindMemory(to: Void.self, capacity: Int(bytes)), count: Int(bytes))
     }
 
     public func reset() throws {
