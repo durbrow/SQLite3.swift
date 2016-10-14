@@ -50,32 +50,53 @@ public final class Database {
     }
 }
 
+private typealias sqlite3_exec_callback = @convention(c) (UnsafeMutableRawPointer?, CInt, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?) -> CInt
+
+private extension Database {
+    func exec(_ sql: UnsafePointer<CChar>!) -> (CInt, String?)
+    {
+        var errmsg : UnsafeMutablePointer<CChar>?
+        let rc = sqlite3_exec(dbh, sql, nil, nil, &errmsg)
+        if rc == SQLITE_OK || errmsg == nil { return (rc, nil) }
+        return (rc, String(cString: errmsg!))
+    }
+    
+    func exec(
+          _ sql: UnsafePointer<CChar>!
+        , _ context: UnsafeMutableRawPointer
+        , _ callback: @escaping sqlite3_exec_callback
+        ) -> (CInt, String?)
+    {
+        var errmsg : UnsafeMutablePointer<CChar>?
+        let rc = sqlite3_exec(dbh, sql, callback, context, &errmsg)
+        if rc == SQLITE_OK || errmsg == nil { return (rc, nil) }
+        defer { sqlite3_free(errmsg) }
+        return (rc, String(cString: errmsg!))
+    }
+}
+
 public extension Database {
     public func execute(sql: String) throws
     {
-        var errmsg : UnsafeMutablePointer<Int8>?
-        let rc = sqlite3_exec(dbh, sql, nil, nil, &errmsg)
+        let (rc, errmsg) = exec(sql)
         if rc == SQLITE_OK { return }
-        defer { sqlite3_free(errmsg) }
-        throw SQLiteError.Error(code: Int(rc), message: errmsg == nil ? "" : String(cString: errmsg!))
+        throw SQLiteError.Error(code: Int(rc), message: errmsg ?? "(no message)")
     }
     
-    public func execute(sql: String, f: @escaping ([String?], [String?])->(Int)) throws {
+    public func execute(sql: String, f: @escaping ([String?], [String?])->(Bool)) throws {
         struct CContext {
-            let function : ([String?], [String?])->(Int)
+            let function : ([String?], [String?])->(Bool)
         }
         var context = CContext(function: f)
-        var errmsg : UnsafeMutablePointer<Int8>?
-        let rc = sqlite3_exec(dbh, sql,
-          { (UP, N, coldata, colname) -> Int32 in
+        let (rc, errmsg) = exec(sql, &context)
+        { UP, N, coldata, colname in
             let data = convert_sqlite_info_array(count: Int(N), array: coldata)
             let name = convert_sqlite_info_array(count: Int(N), array: colname)
             let rslt = UP!.bindMemory(to: CContext.self, capacity: 1).pointee.function(data, name)
-            return CInt(truncatingBitPattern: rslt)
-          }, &context, &errmsg)
+            return rslt ? 0 : 1
+        }
         if rc == SQLITE_OK { return }
-        defer { sqlite3_free(errmsg) }
-        throw SQLiteError.Error(code: Int(rc), message: errmsg == nil ? "" : String(cString: errmsg!))
+        throw SQLiteError.Error(code: Int(rc), message: errmsg ?? "(no message)")
     }
     
     public func execute(sql: String, parameters: () -> [String?]?) throws
@@ -88,32 +109,56 @@ public extension Database {
         }
     }
     
-    public func execute(sql: String, committingEvery soOften: Int, parameters: () -> [String?]?) throws
-    {
-        guard soOften > 1 else { return try execute(sql: sql, parameters: parameters) }
-        try! execute(sql: "BEGIN TRANSACTION")
-        defer { try! execute(sql: "COMMIT TRANSACTION") }
-        do {
-            var countdown = soOften
-            let stm = try prepare(sql: sql)
-            while let params = parameters() {
-                try stm.bind(values: params)
-                _ = try stm.step()
-                try! stm.reset()
-                countdown -= 1
-                if countdown == 0 {
-                    try! execute(sql: "COMMIT TRANSACTION")
-                    try! execute(sql: "BEGIN TRANSACTION")
-                    countdown = soOften
-                }
-            }
-        }
-    }
-    
     public func execute(sql: String, parameters: [[String?]]) throws
     {
         var iter = parameters.makeIterator()
         try execute(sql: sql) { iter.next() }
+    }
+}
+
+public extension Database {
+    public func begin() throws {
+        let (rc, errmsg) = exec("BEGIN TRANSACTION")
+        if rc == SQLITE_OK { return }
+        throw SQLiteError.Error(code: Int(rc), message: errmsg ?? "(no message)")
+    }
+    public func commit() throws {
+        let (rc, errmsg) = exec("COMMIT TRANSACTION")
+        if rc == SQLITE_OK { return }
+        throw SQLiteError.Error(code: Int(rc), message: errmsg ?? "(no message)")
+    }
+    public func rollback() throws {
+        let (rc, errmsg) = exec("ROLLBACK TRANSACTION")
+        if rc == SQLITE_OK { return }
+        throw SQLiteError.Error(code: Int(rc), message: errmsg ?? "(no message)")
+    }
+}
+
+public extension Database {
+    public func execute(sql: String, committingEvery soOften: Int, parameters: () -> [String?]?) throws
+    {
+        if soOften <= 1 {
+            if soOften < 1 { try! begin() }
+            try execute(sql: sql, parameters: parameters)
+            if soOften < 1 { try! commit() }
+            return
+        }
+        var countdown = soOften
+
+        try! begin()
+        let stm = try prepare(sql: sql)
+        while let params = parameters() {
+            try stm.bind(values: params)
+            _ = try stm.step()
+            try! stm.reset()
+            countdown -= 1
+            if countdown == 0 {
+                try! commit()
+                try! begin()
+                countdown = soOften
+            }
+        }
+        try! commit()
     }
 }
 
@@ -126,7 +171,7 @@ public extension Database {
                 print("\(name[i] ?? "\(i)"): \(v ?? "NULL")")
             }
             print("")
-            return 0
+            return true
         }
     }
 }

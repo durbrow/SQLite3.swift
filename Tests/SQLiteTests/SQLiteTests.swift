@@ -8,6 +8,7 @@ class SQLiteTests: XCTestCase {
         let db = try SQLite.Database()
         try db.execute(sql: "CREATE TABLE foo ( bar INTEGER, baz TEXT )")
         try db.execute(sql: "INSERT INTO foo ( bar, baz ) VALUES ( ?, ? )", parameters: [ [ "1", "frotz" ], [ "2", "nozzl" ] ])
+        try db.dump(sql: "SELECT * FROM foo")
         let stm = try db.prepare(sql: "SELECT * FROM foo")
         var i = 0
         while try stm.step() {
