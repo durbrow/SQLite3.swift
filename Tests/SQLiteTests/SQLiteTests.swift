@@ -6,10 +6,10 @@ class SQLiteTests: XCTestCase {
         // This is an example of a functional test case.
         // Use XCTAssert and related functions to verify your tests produce the correct results.
         let db = try SQLite.Database()
-        try db.execute(sql: "CREATE TABLE foo ( bar INTEGER, baz TEXT )")
-        try db.execute(sql: "INSERT INTO foo ( bar, baz ) VALUES ( ?, ? )", parameters: [ [ "1", "frotz" ], [ "2", "nozzl" ] ])
-        try db.dump(sql: "SELECT * FROM foo")
-        let stm = try db.prepare(sql: "SELECT * FROM foo")
+        try db.execute(SQL: "CREATE TABLE foo ( bar INTEGER, baz TEXT )")
+        try db.execute(SQL: "INSERT INTO foo ( bar, baz ) VALUES ( ?, ? )", parameters: [ [ "1", "frotz" ], [ "2", "nozzl" ] ])
+        try db.dump(SQL: "SELECT * FROM foo")
+        let stm = try db.prepare(SQL: "SELECT * FROM foo")
         var i = 0
         while try stm.step() {
             let bar = Int(stm[0] ?? "")
