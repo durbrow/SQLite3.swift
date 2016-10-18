@@ -17,16 +17,15 @@ private typealias CCharConstPointer = UnsafePointer<CChar>?
 /// a C char **
 private typealias CCharPointerPointer = UnsafeMutablePointer<CCharPointer>?
 
-private func convertSQLiteStringArray(count: Int, array: CCharPointerPointer) -> [String?]
-{
-    guard let array = array else { return [] }
-    return UnsafeBufferPointer(start: UnsafePointer(array), count: count).map { $0 == nil ? nil : String(cString: $0!) }
-}
-
+/// A wrapper class for sqlite3 database handle. 
+///
+/// This is the base object in sqlite3
 public final class Database {
+    /// The database handle
     fileprivate let dbh : OpaquePointer
     
-    /// Opens a database
+    /// Opens an sqlite3 database
+    /// - Parameter path: The path to the database to open
     public init(path: String) throws {
         var pDb : OpaquePointer?
         let rc = sqlite3_open(path, &pDb)
@@ -52,6 +51,9 @@ public final class Database {
         return String(cString: sqlite3_errmsg(dbh))
     }
 
+    /// Prepares an SQL statement to be executed.
+    /// - Parameter sql: The statement to be prepared.
+    /// - Returns: A new Statement object.
     public func prepare(SQL sql: String) throws -> Statement {
         var pStm : OpaquePointer?
         let rc = sqlite3_prepare_v2(dbh, sql, -1, &pStm, nil)
@@ -62,44 +64,21 @@ public final class Database {
     }
 }
 
-private func execCallback( _     context: CVoidPointer
-                         , _ columnCount: CInt
-                         , _  columnData: CCharPointerPointer
-                         , _  columnName: CCharPointerPointer
-                         ) -> CInt
-{
-    let f = context!.bindMemory(to: Database.ExecuteCallback.self, capacity: 1).pointee
-    let data = convertSQLiteStringArray(count: Int(columnCount), array: columnData)
-    let name = convertSQLiteStringArray(count: Int(columnCount), array: columnName)
-    return f(data, name) ? 0 : ~0
-}
-
 /// execute SQL convenience functions
 public extension Database {
     public func execute(SQL sql: String) throws
     {
-        var errmsg : CCharPointer = nil
-        let rc = sqlite3_exec(dbh, sql, nil, nil, &errmsg)
-        defer { sqlite3_free(errmsg) }
-        if rc == SQLITE_OK { return }
-        let message = errmsg == nil ? "(no message)" : String(cString: errmsg!)
-        throw SQLiteError.Error(code: Int(rc), message: message)
+        let stm = try prepare(SQL: sql)
+        while try stm.step() {}
     }
     
-    public typealias ExecuteCallback = ([String?], [String?])->Bool
-    public func execute(SQL sql: String, f: @escaping ExecuteCallback) throws
+    public func execute(SQL sql: String, f: (_ values: [String?], _ names: [String?])->Bool) throws
     {
-        // We'll pass our caller's callback as the context
-        // but first we have to made a var copy because
-        // the 4th argument to sqlite3_exec is not a pointer to const
-        var context = f
-
-        var errmsg : CCharPointer = nil
-        let rc = sqlite3_exec(dbh, sql, execCallback, &context, &errmsg)
-        defer { sqlite3_free(errmsg) }
-        if rc == SQLITE_OK { return }
-        let message = errmsg == nil ? "(no message)" : String(cString: errmsg!)
-        throw SQLiteError.Error(code: Int(rc), message: message)
+        let stm = try prepare(SQL: sql)
+        while try stm.step() {
+            let (v, n) = stm.result
+            if !f(v, n) { break }
+        }
     }
     
     public func execute(SQL sql: String, parameters iter: AnyIterator<[String?]>) throws
@@ -173,22 +152,14 @@ public extension Database {
     }
 }
 
-/// create a copy of a Swift.String into memory that can be freed by sqlite3_free
+/// Creates a copy of a Swift.String into memory that can be freed by sqlite3_free
+/// - Parameter value: The string to be copied
+/// - Returns: An UnsafeBufferPointer wrapping the new C string
 private func sqlite_strdup(value: String) -> UnsafeBufferPointer<Int8>
 {
     let length = value.utf8.count
-#if arch(arm64) || arch(x86_64)
-    guard let p = sqlite3_malloc64(sqlite3_uint64(length + 1)) else {
-        return UnsafeBufferPointer(start: nil, count: 0)
-    }
-#else
-    guard let p = sqlite3_malloc(CInt(length + 1)) else {
-        return UnsafeBufferPointer(start: nil, count: 0)
-    }
-#endif
-    value.withCString { p.copyBytes(from: $0, count: length + 1) }
-    let q = UnsafePointer(p.bindMemory(to: Int8.self, capacity: length + 1))
-    return UnsafeBufferPointer(start: q, count: length)
+    let s = value.withCString { withVaList([ $0 ]) { sqlite3_vmprintf("%s", $0) } }
+    return UnsafeBufferPointer(start: s, count: length)
 }
 
 private let sqlite_free : @convention(c) (UnsafeMutableRawPointer?) -> () = { sqlite3_free($0) }
@@ -291,6 +262,19 @@ public final class Statement {
     
     public var columnCount : Int {
         return Int(sqlite3_column_count(stm))
+    }
+    
+    public var result : (values: [String?], names: [String?]) {
+        let n = columnCount
+        let value : [String?] = (0..<n).map {
+            let x = sqlite3_column_text(stm, CInt($0))
+            return x == nil ? nil : String(cString: x!)
+        }
+        let names : [String?] = (0..<n).map {
+            let x = sqlite3_column_name(stm, CInt($0))
+            return x == nil ? nil : String(cString: x!)
+        }
+        return (value, names)
     }
     
     public subscript(i: Int) -> String? {
