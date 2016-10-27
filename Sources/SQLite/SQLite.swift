@@ -99,14 +99,14 @@ public extension Database {
 
 /// transactions
 public extension Database {
-    public func begin() throws {
-        try execute(SQL: "BEGIN TRANSACTION")
+    public func begin() {
+        try! execute(SQL: "BEGIN TRANSACTION")
     }
-    public func commit() throws {
-        try execute(SQL: "COMMIT TRANSACTION")
+    public func commit() {
+        try! execute(SQL: "COMMIT TRANSACTION")
     }
-    public func rollback() throws {
-        try execute(SQL: "ROLLBACK TRANSACTION")
+    public func rollback() {
+        try! execute(SQL: "ROLLBACK TRANSACTION")
     }
 }
 
@@ -114,14 +114,14 @@ public extension Database {
     public func execute(SQL sql: String, committingEvery soOften: Int, parameters: AnyIterator<[String?]>) throws
     {
         if soOften <= 1 {
-            if soOften < 1 { try! begin() }
+            if soOften < 1 { begin() }
             try execute(SQL: sql, parameters: parameters)
-            if soOften < 1 { try! commit() }
+            if soOften < 1 { commit() }
             return
         }
         var countdown = soOften
 
-        try! begin()
+        begin()
         let stm = try prepare(SQL: sql)
         while let params = parameters.next() {
             try stm.bind(values: params)
@@ -129,19 +129,19 @@ public extension Database {
             try! stm.reset()
             countdown -= 1
             if countdown == 0 {
-                try! commit()
-                try! begin()
+                commit()
+                begin()
                 countdown = soOften
             }
         }
-        try! commit()
+        commit()
     }
 }
 
 public extension Database {
-    public func dump(SQL sql: String) throws
+    public func dump(SQL sql: String)
     {
-        try execute(SQL: sql)
+        try! execute(SQL: sql)
         { data, name in
             for (n, v) in zip(name, data)  {
                 print("\(n ?? ""): \(v ?? "NULL")")
